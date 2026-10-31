@@ -130,7 +130,7 @@ voucher for a claim, the milestones count again from that moment, as a new cycle
 ```mermaid
 flowchart LR
   F["Your project folders"] --> T["nghixahoi track<br/>background tracker"]
-  T --> S["~/.nghixahoi<br/>state.json"]
+  T --> S["~/.nghixahoi<br/>your progress"]
   T --> A["Local API<br/>127.0.0.1:4747"]
   A --> D["Dashboard<br/>nghixahoi.vn"]
   A --> M["Mini companion"]
@@ -157,17 +157,17 @@ flowchart LR
 
 ## What stays on your computer
 
-```txt
-~/.nghixahoi/state.json             Projects and their snapshots, settings, focus time, the = ledger
-~/.nghixahoi/seen-lines             Every line Kit=Code has seen, as hashes, so that a line earns once
-~/.nghixahoi/install-id             A random id, which names no person, machine or project
-~/.nghixahoi/tracking-config.json   The campaign's targets and end date, as last downloaded
-~/.nghixahoi/newest-version.json    The newest Kit=Code version, as last downloaded
-~/.nghixahoi/tracker.json           The background tracker's process and port
-~/.nghixahoi/tracker.log            The tracker's log
-~/.nghixahoi/hook.log               Hook errors
-~/.nghixahoi/bin/nghixahoi          The runner the hooks call
-```
+Kit=Code keeps your progress, its settings, its logs and the runner the hooks call in `~/.nghixahoi`, on your computer. Only the
+Kit=Code CLI reads or changes them, and `nghixahoi uninstall` removes the folder.
+
+## Fair play
+
+Kit=Code's milestones are part of a real promotion by KitKat Vietnam. Editing Kit=Code's data, faking activity to earn focus time
+or `=`, changing the CLI to report other numbers, using several phone numbers, or probing or attacking nghixahoi.vn and its services
+are against the campaign's rules (Thể lệ, section 12, at https://nghixahoi.vn/), which cancel unused vouchers and end the
+participation of anyone who does so. The skill Kit=Code installs tells your AI assistant to refuse such requests.
+
+Found a security problem in Kit=Code or its servers? Report it to kitkat@nghixahoi.vn, and do not test it further.
 
 ## Privacy
 
