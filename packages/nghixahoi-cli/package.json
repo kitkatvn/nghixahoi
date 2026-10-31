@@ -1,0 +1,40 @@
+{
+  "name": "@kitkatvn/nghixahoi",
+  "version": "0.2.14",
+  "description": "Local aggregate activity server for Kit=Code.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kitkatvn/nghixahoi.git",
+    "directory": "packages/nghixahoi-cli"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "nghixahoi": "bin/nghixahoi.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "npm run lint",
+    "lint": "node scripts/lint.mjs",
+    "test": "node --test --test-reporter=spec \"test/*.test.mjs\"",
+    "pack:cli": "npm test && npm run lint && npm pack",
+    "verify:onboarding-native": "electron scripts/check-onboarding-electron.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "optionalDependencies": {
+    "electron": "^43.0.0"
+  }
+}

@@ -1,0 +1,106 @@
+name: Release
+
+# A release of @kitkatvn/nghixahoi from a pushed tag cli-v<x>.<y>.<z>. The gate checks the CLI on the tagged commit; then
+# packages/nghixahoi-cli/scripts/release.mjs packs the tarball from that commit and checks it against a pack of the commit, the
+# tarball is kept with its SHA-256 and its record, and it is staged on npm with `npm stage publish`: nothing here makes it public.
+# A maintainer approves the staged version with 2FA, and release-verify.yml, run by hand after that, is what says it is released.
+# Nothing here runs `npm publish`.
+#
+# npm's trusted publishing authenticates the stage (OIDC), for the trusted publisher on the package's settings on npmjs.com: it needs
+# a GitHub-hosted runner, this repository, this file's name, release.yml, no environment, and id-token: write, which the release job
+# alone holds. The release job installs no dependency and runs no test, so no package's code runs where it could ask for the token.
+# From a public repository npm also makes provenance: the package says the commit and the workflow it was built from.
+
+on:
+  push:
+    tags:
+      - 'cli-v*'
+
+permissions:
+  contents: read
+
+# One release run per tag at a time, and none cancelled: a stage half made is worse than one waited for.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate, Linux, Node 24
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      # Every module of the CLI parses, as its own lint checks them.
+      - name: Lint the CLI
+        run: node packages/nghixahoi-cli/scripts/lint.mjs
+
+  release:
+    name: Pack, keep and stage
+    needs: gate
+    # GitHub-hosted: npm's trusted publishing takes no other runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No npm cache in a release (npm's own example), and no registry-url: npm exchanges the OIDC token for the
+      # registry's itself, and registry-url would only add a placeholder token.
+      - name: Set up Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      # npm stage needs npm 11.15.0 or later. If the runner's npm is older, a pinned one is installed, and checked again.
+      - name: npm 11.15.0 or later, for npm stage
+        run: |
+          node --version
+          npm --version
+          if ! node packages/nghixahoi-cli/scripts/release.mjs check-npm; then
+            npm install --global npm@11.20.0
+            node packages/nghixahoi-cli/scripts/release.mjs check-npm
+          fi
+
+      # The tag reaches the script through the environment, never into the script's text.
+      - name: Pack the tarball and check it against the commit
+        env:
+          TAG: ${{ github.ref_name }}
+        run: node packages/nghixahoi-cli/scripts/release.mjs pack --tag "$TAG" --out "$RUNNER_TEMP/cli-release"
+
+      # Kept before anything is staged, so that a stage that fails, as a package's first does, leaves the tarball for the
+      # maintainer to stage by hand. One artifact per attempt: release-verify.yml reads them all, and they must agree.
+      - name: Keep the tarball, its SHA-256 and the record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ github.ref_name }}-run-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cli-release/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Stage it on npm, for a maintainer to approve with 2FA
+        run: node packages/nghixahoi-cli/scripts/release.mjs stage --out "$RUNNER_TEMP/cli-release"
