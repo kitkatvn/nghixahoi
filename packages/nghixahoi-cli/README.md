@@ -66,7 +66,7 @@ nghixahoi dashboard</code></pre>
   </tr>
 </table>
 
-Local API: `http://127.0.0.1:4747`
+Local API: `http://127.0.0.1:4747`, or, when another program holds that port, the next free one up to 4751 (`nghixahoi status` names it).
 
 Finish **Welcome** with at least one project folder before expecting tracking to work.
 

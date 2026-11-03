@@ -231,8 +231,11 @@ export function snapshotLineKeys(snapshot, fileKeys = null) {
 // (store.mjs). An older snapshot is written as it always was, two spaces a level, until it is converted.
 export function lineMapsWrittenOnOneLine(state) {
   const maps = new Set();
+  const projects = Object.values(isObject(state?.projects) ? state.projects : {});
+  // A repository's worktrees (runtime.mjs noteWorktrees) are stored in its record.
+  const worktrees = projects.flatMap((project) => (isObject(project?.worktrees) ? Object.values(project.worktrees) : []));
 
-  for (const project of Object.values(isObject(state?.projects) ? state.projects : {})) {
+  for (const project of [...projects, ...worktrees]) {
     const snapshot = project?.sourceSnapshot;
 
     if (isObject(snapshot) && snapshot.version === SNAPSHOT_FORMAT && isObject(snapshot.files)) {
@@ -273,6 +276,29 @@ function pathCrossesSymlink(root, relativePath) {
       }
     } catch {
       return true;
+    }
+  }
+
+  return false;
+}
+
+// True when a folder on the way from `root` to `relativePath` holds a repository of its own, a `.git` folder or file: a worktree,
+// a clone or a submodule inside a Git project. git lists such a folder as one entry and never enters it, so a full scan reads
+// nothing in it; since 0.2.16 a changed-path scan does not either (docs/reward-rules.md §5.4). Until then a file written there
+// was read by the project's changed-path scan, checked against the project's git, not the worktree's: what git brought into
+// a worktree inside the project could count. A worktree is scanned as itself since 0.2.16 (§5.9).
+function insideNestedRepository(root, relativePath) {
+  const parts = String(relativePath).split('/').filter(Boolean);
+  let current = root;
+
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    current = path.join(current, parts[index]);
+
+    try {
+      fs.lstatSync(path.join(current, '.git'));
+      return true;
+    } catch {
+      // No repository here.
     }
   }
 
@@ -448,8 +474,8 @@ function readUnder(rules, complete) {
 }
 
 // Reads a project for a scan, counted under `rules`, without touching any snapshot. With
-// `changedPaths`, only those files: a path an ignore rule now matches comes back `missing` and
-// `ignored`, so its old entry is dropped. Without, every file: `complete`, and files it did not list
+// `changedPaths`, only those files: a path an ignore rule now matches, or one in a repository inside a Git project
+// (insideNestedRepository), comes back `missing` and `ignored`, so its old entry is dropped. Without, every file: `complete`, and files it did not list
 // are gone from the snapshot. The read carries its `rulesVersion`. Throws when the project cannot be
 // listed.
 export function readProjectSources(root, {sourceType = 'vibe', changedPaths = null, rules = CURRENT_RULES} = {}) {
@@ -459,7 +485,8 @@ export function readProjectSources(root, {sourceType = 'vibe', changedPaths = nu
 
   const candidates = [...new Set(changedPaths.map((changedPath) => normalizeChangedPath(root, changedPath)).filter(Boolean))]
     .filter((relativePath) => !shouldIgnoreRelativePath(relativePath));
-  const ignored = new Set(sourceType === 'git' ? ignoredPaths(root, candidates) : []);
+  const nested = sourceType === 'git' ? candidates.filter((relativePath) => insideNestedRepository(root, relativePath)) : [];
+  const ignored = new Set([...nested, ...(sourceType === 'git' ? ignoredPaths(root, candidates.filter((relativePath) => !nested.includes(relativePath))) : [])]);
 
   return {
     ...readUnder(rules, false),

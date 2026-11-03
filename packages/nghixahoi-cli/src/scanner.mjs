@@ -71,8 +71,9 @@ export function createScanner({onError} = {}) {
     read({root, sourceType, changedPaths = null, since}) {
       return request({kind: 'read', root, sourceType, changedPaths, since});
     },
-    git({root}) {
-      return request({kind: 'git', root});
+    // With `worktrees`, the repository's worktrees too (scan-worker.mjs describeWorktrees).
+    git({root, worktrees = false}) {
+      return request({kind: 'git', root, worktrees});
     },
     async close() {
       const thread = worker;

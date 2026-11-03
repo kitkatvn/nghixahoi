@@ -6,11 +6,13 @@ import {fileURLToPath} from 'node:url';
 import {reachableAddress} from './api-access.mjs';
 import {renderCompanionWindow} from './companion-window.mjs';
 import {resolveDashboardUrl} from './open-dashboard.mjs';
+import {recordedTrackerPort} from './tracker-instance.mjs';
 import {keepWindowOnItsPage} from './window-guards.mjs';
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const host = process.env.NGHIXAHOI_HOST ?? '127.0.0.1';
-const port = process.env.NGHIXAHOI_PORT ?? '4747';
+// The port Welcome or the CLI gave, or the one this HOME's tracker took (src/tracker-ports.mjs).
+const port = process.env.NGHIXAHOI_PORT ?? String(recordedTrackerPort());
 // The URL sets the Host header, and the API answers only a loopback Host (api-access.mjs).
 const apiBase = `http://${reachableAddress(host)}:${port}`;
 const companionPreload = path.join(sourceDirectory, 'companion-preload.cjs');

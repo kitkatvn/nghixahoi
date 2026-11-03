@@ -8,6 +8,7 @@ import {describeProjects, listProjectRecords, registerNewProjects, removeProject
 import {diagnosticsEnabled, readInvitedEmail, setInvitedEmail} from './diagnostics.mjs';
 import {DASHBOARD_URL} from './integration-spec.mjs';
 import {onboardingPreferences, saveOnboardingPreferences, STORE_DIR} from './store.mjs';
+import {recordedTrackerPort} from './tracker-instance.mjs';
 import {resolveSetupPlatform} from './onboarding-platform.mjs';
 import {renderOnboardingWindow} from './onboarding-window.mjs';
 import {WELCOME_ERRORS, WELCOME_TESTER_ERRORS, WELCOME_WORDS} from './welcome-words.mjs';
@@ -18,7 +19,9 @@ const preloadPath = path.join(sourceDirectory, 'onboarding-preload.cjs');
 const cliEntry = process.env.NGHIXAHOI_CLI_ENTRY;
 const companionEntry = path.join(sourceDirectory, 'companion-electron.mjs');
 const host = process.env.NGHIXAHOI_HOST ?? '127.0.0.1';
-const port = process.env.NGHIXAHOI_PORT ?? '4747';
+// A port given (`nghixahoi setup --port`), or none: the tracker then takes the first free of 4747 to 4751, and the Mini opens where
+// it did (src/tracker-ports.mjs).
+const port = process.env.NGHIXAHOI_PORT;
 let window;
 let pendingFocus = false;
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
@@ -82,7 +85,7 @@ function openCompanion() {
     env: {
       ...process.env,
       NGHIXAHOI_HOST: host,
-      NGHIXAHOI_PORT: port,
+      NGHIXAHOI_PORT: port ?? String(recordedTrackerPort()),
       NGHIXAHOI_DASHBOARD_URL: DASHBOARD_URL,
       NGHIXAHOI_NO_OPEN: '1',
     },
@@ -181,7 +184,7 @@ app.whenReady().then(() => {
     if (!folders.length && !listProjectRecords().length) return {ok: false, error: WELCOME_ERRORS.noProjects};
     try { registerNewProjects(folders); } catch { return {ok: false, error: WELCOME_ERRORS.registerFailed}; }
     const selection = {autoTrack: input?.autoTrack === true, companionView: 'mini'};
-    if (selection.autoTrack && !(await runCli(['track', '--host', host, '--port', port]))) {
+    if (selection.autoTrack && !(await runCli(['track', '--host', host, ...(port ? ['--port', port] : [])]))) {
       saveOnboardingPreferences({...selection, completed: false});
       return {
         ok: false,

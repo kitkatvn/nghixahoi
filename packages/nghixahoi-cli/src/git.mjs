@@ -77,6 +77,25 @@ export function countCommits(repoRoot) {
   }
 }
 
+// The worktrees of the repository at `repoRoot`, as `git worktree list --porcelain` names them, the main one first: each with its
+// folder, and whether git calls it bare (a repository with no files of its own) or prunable (its folder, or its link to the
+// repository, is gone). Throws when git cannot list them.
+export function listWorktrees(repoRoot) {
+  const worktrees = [];
+
+  for (const line of runGit(repoRoot, ['worktree', 'list', '--porcelain'], {trim: false}).split('\n').map((text) => text.replace(/\r$/, ''))) {
+    if (line.startsWith('worktree ')) {
+      worktrees.push({path: line.slice('worktree '.length), bare: false, prunable: false});
+    } else if (worktrees.length > 0 && line === 'bare') {
+      worktrees.at(-1).bare = true;
+    } else if (worktrees.length > 0 && (line === 'prunable' || line.startsWith('prunable '))) {
+      worktrees.at(-1).prunable = true;
+    }
+  }
+
+  return worktrees;
+}
+
 // `git status --porcelain=v1 -z`: each entry is two status letters, a space and a path, and a rename
 // or a copy is followed by the path it came from. Paths come as they are, never quoted.
 function statusEntries(output) {

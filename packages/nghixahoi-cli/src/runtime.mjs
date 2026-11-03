@@ -4,7 +4,7 @@ import path from 'node:path';
 import process from 'node:process';
 import crypto from 'node:crypto';
 import {addSourceEqualsOnce, equalsLedgerFrom, loadEqualsLedger, removeProjectEquals} from './equals-ledger.mjs';
-import {countCommits, createFolderProjectId, createProjectId, tryDetectRepoRoot} from './git.mjs';
+import {countCommits, createFolderProjectId, createProjectId, detectRepoRoot, listWorktrees, tryDetectRepoRoot} from './git.mjs';
 import {
   isLineSeen,
   loadSeenLines,
@@ -49,7 +49,7 @@ import {updateAvailable} from './newest-version.mjs';
 import {createScanner} from './scanner.mjs';
 
 export const DEFAULT_HOST = '127.0.0.1';
-export const DEFAULT_PORT = 4747;
+export {DEFAULT_PORT} from './tracker-ports.mjs';
 
 const SYNC_INTERVAL_MS = 2000;
 const SAVE_INTERVAL_MS = 10000;
@@ -64,6 +64,8 @@ const SCAN_LOCK_TIMEOUT_MS = 1000;
 const SCAN_RETRY_MS = 2000;
 // A project whose folder cannot be watched is scanned this often instead.
 export const POLL_INTERVAL_MS = 5000;
+// After git changes a repository's list of worktrees in its own folder (.git/worktrees), the list is asked for this much later.
+const WORKTREES_SETTLE_MS = 1000;
 const SILENT_LOG = {info() {}, warn() {}, error() {}};
 
 function isObject(value) {
@@ -88,14 +90,75 @@ function normalizeProject(project) {
       : project.vibeSnapshot?.files && typeof project.vibeSnapshot === 'object'
         ? project.vibeSnapshot
         : null,
+    // A worktree the tracker found (noteWorktrees): the repository it is a worktree of, and since when git no longer lists it.
+    ...(typeof project.worktreeOf === 'string' ? {worktreeOf: project.worktreeOf, ...(project.goneAt ? {goneAt: project.goneAt} : {})} : {}),
   };
+}
+
+// A repository's worktrees the tracker found (noteWorktrees; docs/reward-rules.md §5.9), kept in its record by id, each a project
+// record of its own: a Kit=Code from before them keeps the field as it is, and reads nothing in it.
+function storedWorktrees(record) {
+  return isObject(record?.worktrees) ? record.worktrees : {};
+}
+
+// Every project record of a stored state, as [id, record, the id of the repository it is a worktree of, or null]. A worktree that
+// is also a project of its own is that project, and is listed once.
+function storedRecords(stored) {
+  const projects = isObject(stored?.projects) ? stored.projects : {};
+  const records = Object.entries(projects).map(([id, record]) => [id, record, null]);
+  const listed = new Set(Object.keys(projects));
+
+  for (const [parentId, parent] of Object.entries(projects)) {
+    for (const [id, record] of Object.entries(storedWorktrees(parent))) {
+      if (isObject(record) && !listed.has(id)) {
+        listed.add(id);
+        records.push([id, record, parentId]);
+      }
+    }
+  }
+
+  return records;
+}
+
+// Where project `id`'s record is in a stored state, `holder[key]`, among the projects or a repository's worktrees; or null.
+function recordPlace(stored, id) {
+  const projects = isObject(stored?.projects) ? stored.projects : null;
+
+  if (!projects) {
+    return null;
+  }
+
+  if (isObject(projects[id])) {
+    return {holder: projects, key: id};
+  }
+
+  for (const parent of Object.values(projects)) {
+    if (isObject(storedWorktrees(parent)[id])) {
+      return {holder: parent.worktrees, key: id};
+    }
+  }
+
+  return null;
+}
+
+function storedRecord(stored, id) {
+  const place = recordPlace(stored, id);
+  return place ? place.holder[place.key] : undefined;
+}
+
+// Replaces project `id`'s record, wherever it is stored, with `make` of it (a legacy vibeSnapshot left out).
+function replaceRecord(stored, id, make) {
+  const place = recordPlace(stored, id);
+  const {vibeSnapshot, ...current} = place.holder[place.key];
+  place.holder[place.key] = make(current);
+  return place.holder[place.key];
 }
 
 function normalizeState(state) {
   const projects = {};
 
-  for (const [id, project] of Object.entries(state.projects ?? {})) {
-    projects[id] = normalizeProject({id, ...project});
+  for (const [id, project, parentId] of storedRecords(state)) {
+    projects[id] = normalizeProject({id, ...project, ...(parentId === null ? {} : {sourceType: 'git', worktreeOf: parentId})});
   }
 
   return {
@@ -208,8 +271,9 @@ function storeProject(stored, project) {
   stored.version = 4;
 }
 
+// The projects the person added: a worktree the tracker found is counted with its repository.
 function projectTotals(state) {
-  const projects = Object.values(normalizeState(state).projects);
+  const projects = Object.values(normalizeState(state).projects).filter((project) => !project.worktreeOf);
 
   return {
     totalProjects: projects.length,
@@ -297,7 +361,7 @@ function rulesOfRecord(projectId, record, {newest = RULES_VERSION} = {}) {
 // so no hash of a line of a secret file outlives that scan in seen-lines (ruling, 2026-09-25).
 export function migrateState({newest = RULES_VERSION} = {}) {
   return withStateLock(() => {
-    const projects = Object.entries(loadState().projects ?? {}).filter(([, record]) => isObject(record) && storedSnapshot(record) !== null);
+    const projects = storedRecords(loadState()).filter(([, record]) => isObject(record) && storedSnapshot(record) !== null);
     const seed = !seenLinesExist();
     const converted = [];
     const seen = [];
@@ -326,8 +390,7 @@ export function migrateState({newest = RULES_VERSION} = {}) {
     if (converted.length > 0) {
       updateState((stored) => {
         for (const [projectId, snapshot] of converted) {
-          const {vibeSnapshot, ...current} = stored.projects[projectId];
-          stored.projects[projectId] = {...current, sourceSnapshot: snapshot};
+          replaceRecord(stored, projectId, (current) => ({...current, sourceSnapshot: snapshot}));
         }
       });
     }
@@ -351,7 +414,7 @@ const SWITCH_ATTEMPTS = 3;
 // before hardening phase 2 recorded no git position, so a Git project's switch from it counts nothing.
 export function switchProjectRules(projectId, {rules = RULES, to = RULES_VERSION} = {}) {
   for (let attempt = 0; attempt < SWITCH_ATTEMPTS; attempt += 1) {
-    const record = loadState().projects?.[projectId];
+    const record = storedRecord(loadState(), projectId);
     const from = isObject(record) ? rulesOfRecord(projectId, record, {newest: to}) : null;
 
     if (from === null || from >= to) {
@@ -375,7 +438,7 @@ export function switchProjectRules(projectId, {rules = RULES, to = RULES_VERSION
     const [oldRead, newRead] = reads;
     const result = withStateLock(() => {
       migrateState({newest: to});
-      const snapshot = snapshotOf(loadState().projects?.[projectId]);
+      const snapshot = snapshotOf(storedRecord(loadState(), projectId));
 
       // Another process counted in it since the read began: read it again.
       if (!snapshot || snapshot.rulesVersion !== from || !sameSnapshotFiles(snapshot.files, base.files)) {
@@ -389,11 +452,10 @@ export function switchProjectRules(projectId, {rules = RULES, to = RULES_VERSION
       )));
 
       updateState((stored) => {
-        const {vibeSnapshot, ...current} = stored.projects[projectId];
-        stored.projects[projectId] = {...current, sourceSnapshot: {...credited.snapshot, rulesVersion: to, files}};
+        const switched = replaceRecord(stored, projectId, (current) => ({...current, sourceSnapshot: {...credited.snapshot, rulesVersion: to, files}}));
 
         if (credited.equalsAdded > 0) {
-          stored.projects[projectId].changeBatchCount = (Number(current.changeBatchCount) || 0) + 1;
+          switched.changeBatchCount = (Number(switched.changeBatchCount) || 0) + 1;
           addSourceEqualsOnce(project, crypto.randomUUID(), credited.equalsAdded);
           noteMilestonesReached(stored);
         }
@@ -423,7 +485,7 @@ export function prepareState({rules = RULES, to = RULES_VERSION} = {}) {
   const switched = [];
   const unreadable = [];
 
-  for (const [projectId, record] of Object.entries(loadState().projects ?? {})) {
+  for (const [projectId, record] of storedRecords(loadState())) {
     if (!isObject(record) || (rulesOfRecord(projectId, record, {newest: to}) ?? to) >= to) {
       continue;
     }
@@ -460,7 +522,7 @@ function foldScan(project, read, base, {lockTimeoutMs, focusSeconds} = {}) {
   return withStateLock(() => {
     // An older file is converted first, in this same update: after an upgrade, the first scan does it.
     migrateState();
-    const record = loadState().projects?.[project.id];
+    const record = storedRecord(loadState(), project.id);
 
     if (!isObject(record)) {
       return null;
@@ -489,11 +551,10 @@ function foldScan(project, read, base, {lockTimeoutMs, focusSeconds} = {}) {
 
     if (!snapshot || record.vibeSnapshot || result.changedFiles > 0 || result.equalsAdded > 0 || result.gitMoved) {
       updateState((stored) => {
-        const {vibeSnapshot, ...current} = stored.projects[project.id];
-        stored.projects[project.id] = {...current, sourceSnapshot: result.snapshot};
+        const folded = replaceRecord(stored, project.id, (current) => ({...current, sourceSnapshot: result.snapshot}));
 
         if (result.equalsAdded > 0) {
-          stored.projects[project.id].changeBatchCount = (Number(current.changeBatchCount) || 0) + 1;
+          folded.changeBatchCount = (Number(folded.changeBatchCount) || 0) + 1;
           addSourceEqualsOnce(project, crypto.randomUUID(), result.equalsAdded);
           // = credited can make a milestone ready: recorded in this same update (docs/reward-rules.md §6.1).
           noteMilestonesReached(stored, undefined, {focusSeconds});
@@ -506,7 +567,7 @@ function foldScan(project, read, base, {lockTimeoutMs, focusSeconds} = {}) {
 
     return {
       ...result,
-      changeBatchCount: Number(after.projects[project.id].changeBatchCount) || 0,
+      changeBatchCount: Number(storedRecord(after, project.id).changeBatchCount) || 0,
       ledger: equalsLedgerFrom(after),
       record: after.milestonesReached,
     };
@@ -557,12 +618,12 @@ export function createRuntime(options) {
 export function registerProject(targetPath = '.') {
   const detected = detectProject(targetPath);
   const project = {id: detected.id, repoRoot: detected.root, sourceType: detected.sourceType};
-  let registered = loadState().projects?.[detected.id];
+  let registered = storedRecord(loadState(), detected.id);
 
   // A snapshot taken under older counting rules is switched first (docs/reward-rules.md §5.6).
   if (isObject(registered) && (rulesOfRecord(detected.id, registered) ?? RULES_VERSION) < RULES_VERSION) {
     switchProjectRules(detected.id);
-    registered = loadState().projects?.[detected.id];
+    registered = storedRecord(loadState(), detected.id);
   }
 
   // The files are read outside the lock: on a large project that takes a while, and the tracker and
@@ -575,6 +636,8 @@ export function registerProject(targetPath = '.') {
   return withStateLock(() => {
     // An older file is converted in this same update, so a command that fails converts nothing.
     migrateState();
+    // A worktree the tracker found becomes a project of its own, with all it has counted (docs/reward-rules.md §5.9).
+    promoteWorktree(detected.id);
     const record = loadState().projects?.[detected.id];
 
     if (!isObject(record)) {
@@ -602,14 +665,71 @@ export function registerProject(targetPath = '.') {
   });
 }
 
+// Moves a worktree the tracker found among the projects, as it is, when the person adds it. Writes nothing otherwise.
+function promoteWorktree(projectId) {
+  const state = loadState();
+  const place = recordPlace(state, projectId);
+
+  if (!place || place.holder === state.projects) {
+    return;
+  }
+
+  updateState((stored) => {
+    const found = recordPlace(stored, projectId);
+    const {goneAt, ...record} = found.holder[found.key];
+    delete found.holder[found.key];
+    stored.projects[projectId] = {...record, id: projectId, active: true};
+  });
+}
+
 export function listProjects() {
   return projectTotals(loadState());
 }
 
+// The worktrees of the added repositories as git lists them now, for `nghixahoi status` (docs/reward-rules.md §5.9): each one the
+// tracker counts with its repository, `ok`, and each it cannot, `prunable` or `unreadable`, by its folder. A worktree that is a
+// project of its own is that project, and not listed.
+export function describeWorktrees() {
+  const state = normalizeState(loadState());
+  const added = Object.values(state.projects).filter((project) => !project.worktreeOf);
+  const addedIds = new Set(added.map((project) => project.id));
+  const worktrees = new Map();
+
+  for (const project of added.filter((entry) => entry.sourceType === 'git')) {
+    let listed;
+
+    try {
+      listed = listWorktrees(project.repoRoot);
+    } catch {
+      continue;
+    }
+
+    for (const worktree of listed.filter((entry) => !entry.bare && !worktrees.has(entry.path))) {
+      if (worktree.prunable) {
+        worktrees.set(worktree.path, {path: worktree.path, state: 'prunable'});
+        continue;
+      }
+
+      try {
+        const root = detectRepoRoot(worktree.path);
+
+        if (root !== project.repoRoot && !addedIds.has(createProjectId(root))) {
+          worktrees.set(worktree.path, {path: worktree.path, state: 'ok'});
+        }
+      } catch {
+        worktrees.set(worktree.path, {path: worktree.path, state: 'unreadable'});
+      }
+    }
+  }
+
+  return [...worktrees.values()];
+}
+
+// The projects the person added. A worktree the tracker found is not one: it is counted with its repository.
 export function listProjectRecords() {
   const state = normalizeState(loadState());
 
-  return Object.values(state.projects).map((project) => ({
+  return Object.values(state.projects).filter((project) => !project.worktreeOf).map((project) => ({
     id: project.id,
     repoRoot: project.repoRoot,
     sourceType: project.sourceType,
@@ -648,6 +768,11 @@ export function removeProject(targetPathOrProjectId = '.') {
       return null;
     }
 
+    // A worktree the tracker found goes when git removes it, or with its repository: removed alone, the next poll would find it.
+    if (project.worktreeOf) {
+      return {worktreeOf: state.projects[project.worktreeOf]?.repoRoot ?? project.worktreeOf};
+    }
+
     return updateState((stored) => {
       // Removing a project never lowers focus time (docs/reward-rules.md §4): the shared clock
       // cannot say which project a second belonged to. A file from before the shared clock starts
@@ -656,9 +781,15 @@ export function removeProject(targetPathOrProjectId = '.') {
         stored.focusTime = startedFocusTime(stored);
       }
 
+      // Its worktrees go with it, and what they counted, as what it counted goes (§4).
+      const worktreeIds = Object.keys(storedWorktrees(stored.projects[projectId])).filter((id) => !(id in stored.projects));
       delete stored.projects[projectId];
       stored.version = 4;
       removeProjectEquals(projectId);
+
+      for (const id of worktreeIds) {
+        removeProjectEquals(id);
+      }
 
       return projectTotals(stored);
     });
@@ -786,7 +917,11 @@ function enqueue(runtime, projectId, run, job) {
     try {
       await job();
     } catch (error) {
-      scanFailed(runtime, projectId, error);
+      // A scan that was under way when its project stopped (a worktree gone, say) has nothing left to report to: a problem raised
+      // now would stay, with no scan to clear it.
+      if (!run.stopped) {
+        scanFailed(runtime, projectId, error);
+      }
     }
   });
 
@@ -846,6 +981,10 @@ function scanFailed(runtime, projectId, error) {
 
   // The project could not be read now: its folder is gone, or git could not list it. Its snapshot
   // stays as it is, and the next scan tries again.
+  if (worktreeGone(runtime, projectId, error)) {
+    return;
+  }
+
   const root = runtime.state.projects[projectId]?.repoRoot ?? projectId;
   const missing = error?.code === 'ENOENT' || error?.code === 'ENOTDIR';
   reportProblem(runtime, missing ? 'project-missing' : 'scan-failed', projectId, `Scanning ${root} failed (${error?.code ?? 'error'}: ${error?.message ?? error}); its snapshot is kept, and nothing in it is counted until a scan succeeds.`, error);
@@ -1010,6 +1149,13 @@ function onWatchEvent(runtime, projectId, run, fileName) {
   if (fileName === null || fileName === undefined || fileName === '') {
     // The platform did not say which file changed: look at them all.
     run.rescanRequested = true;
+  } else if (/^\.git[\\/]worktrees(?:[\\/]|$)/.test(String(fileName))) {
+    // `git worktree add` or `remove` in this repository: its worktrees are asked for soon, not at the next poll (noteWorktrees).
+    run.worktreesTimer ??= setTimeout(() => {
+      run.worktreesTimer = null;
+      pollGit(runtime, projectId, run);
+    }, WORKTREES_SETTLE_MS);
+    return;
   } else if (shouldIgnoreRelativePath(String(fileName))) {
     return;
   } else if (!run.changedPaths.has(String(fileName))) {
@@ -1031,6 +1177,10 @@ function watchFailed(runtime, projectId, run, error) {
   }
 
   const root = runtime.state.projects[projectId]?.repoRoot ?? projectId;
+
+  if (worktreeGone(runtime, projectId, error)) {
+    return;
+  }
 
   if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
     reportProblem(runtime, 'project-missing', projectId, `Watching ${root} failed (${error.code}: ${error.message}): the folder is gone, so nothing in it is counted.`, error);
@@ -1067,10 +1217,18 @@ function pollGit(runtime, projectId, run) {
   }
 
   run.gitPending = true;
-  runtime.scanner.git({root: project.repoRoot}).then(({signature, commitCount}) => {
+  runtime.scanner.git({root: project.repoRoot, worktrees: !project.worktreeOf}).then(({signature, commitCount, worktrees}) => {
     const current = runtime.state.projects[projectId];
 
-    if (!current || run.stopped || signature === null) {
+    if (!current || run.stopped) {
+      return;
+    }
+
+    if (Array.isArray(worktrees)) {
+      noteWorktreesSafely(runtime, projectId, worktrees);
+    }
+
+    if (signature === null) {
       return;
     }
 
@@ -1085,6 +1243,111 @@ function pollGit(runtime, projectId, run) {
   }).finally(() => {
     run.gitPending = false;
   });
+}
+
+// What a repository's worktrees are, by a poll's listing (scan-worker.mjs describeWorktrees; docs/reward-rules.md §5.9). Each one
+// git lists that the tracker has not met is stored in the repository's record with no snapshot, so that its first scan is its
+// baseline: nothing it holds when it is found counts. It is then watched and scanned as a project of its own, against the lines
+// seen, so that a line counts once in all of them. One that git no longer lists, or calls prunable, or that git cannot read, is
+// stopped, with all it counted kept (`goneAt`); listed again, its first scan is a baseline again. A worktree that is a project of
+// its own, or another repository's worktree, is left as it is. Nothing is written when nothing changed.
+function noteWorktrees(runtime, projectId, listed) {
+  const project = runtime.state.projects[projectId];
+
+  if (!project || project.worktreeOf) {
+    return;
+  }
+
+  const found = new Map(listed
+    .filter((worktree) => worktree.state === 'ok' && worktree.id !== projectId && worktree.root !== project.repoRoot)
+    .map((worktree) => [worktree.id, worktree]));
+  const known = Object.values(runtime.state.projects).filter((record) => record.worktreeOf === projectId);
+  const changed = [...found.keys()].some((id) => !runtime.state.projects[id] || (runtime.state.projects[id].worktreeOf === projectId && runtime.state.projects[id].goneAt))
+    || known.some((record) => !record.goneAt && !found.has(record.id));
+
+  if (!changed) {
+    return;
+  }
+
+  updateState((stored) => {
+    const parent = stored.projects?.[projectId];
+
+    if (!isObject(parent)) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    parent.worktrees = storedWorktrees(parent);
+
+    for (const [id, worktree] of found) {
+      const place = recordPlace(stored, id);
+      const current = parent.worktrees[id];
+
+      if (place && place.holder !== parent.worktrees) {
+        continue;
+      }
+
+      if (!isObject(current)) {
+        parent.worktrees[id] = {
+          id,
+          repoRoot: worktree.root,
+          sourceType: 'git',
+          active: true,
+          activeSeconds: 0,
+          idleSeconds: 0,
+          commitCount: 0,
+          changeBatchCount: 0,
+          lastActiveAt: now,
+          sourceSnapshot: null,
+          foundAt: now,
+        };
+        runtime.log.info(`worktree found: ${worktree.root}, of ${project.repoRoot}; what it holds now is its baseline`);
+      } else if (current.goneAt) {
+        // Git may have put anything there meanwhile.
+        const {goneAt, ...kept} = current;
+        parent.worktrees[id] = {...kept, repoRoot: worktree.root, sourceSnapshot: null};
+        runtime.log.info(`worktree back: ${worktree.root}, of ${project.repoRoot}; what it holds now is its baseline`);
+      }
+    }
+
+    for (const [id, current] of Object.entries(parent.worktrees)) {
+      if (isObject(current) && !current.goneAt && !found.has(id)) {
+        parent.worktrees[id] = {...current, goneAt: now};
+        runtime.log.info(`worktree gone: ${current.repoRoot}, of ${project.repoRoot}; what it counted is kept`);
+      }
+    }
+  }, {lockTimeoutMs: SCAN_LOCK_TIMEOUT_MS});
+
+  // At once, not at the next sync: a worktree found is watched, and its baseline taken, before more is written in it.
+  reconcileProjects(runtime);
+}
+
+// A worktree the tracker found whose folder is gone: its repository's worktrees are asked for again at once, and it is stopped
+// there (noteWorktrees), instead of raising a problem. True when that is so.
+function worktreeGone(runtime, projectId, error) {
+  const project = runtime.state.projects[projectId];
+  const parentRun = project?.worktreeOf ? runtime.projectRuns.get(project.worktreeOf) : undefined;
+
+  // git run in a folder that is gone fails with its own exit code, not ENOENT.
+  if (!parentRun || !(error?.code === 'ENOENT' || error?.code === 'ENOTDIR' || !fs.existsSync(project.repoRoot))) {
+    return false;
+  }
+
+  pollGit(runtime, project.worktreeOf, parentRun);
+  return true;
+}
+
+// A busy lock waits for the next poll; a state file that cannot be read stops the tracker, as a scan's does.
+function noteWorktreesSafely(runtime, projectId, listed) {
+  try {
+    noteWorktrees(runtime, projectId, listed);
+  } catch (error) {
+    if (error instanceof StateFileError) {
+      runtime.watcherOptions?.onStateError?.(error);
+    } else if (!(error instanceof StateLockError)) {
+      runtime.log.error(`Noting the worktrees of ${runtime.state.projects[projectId]?.repoRoot ?? projectId} failed: ${error?.message ?? error}`);
+    }
+  }
 }
 
 function startProject(runtime, project) {
@@ -1102,6 +1365,7 @@ function startProject(runtime, project) {
     changedPaths: new Map(),
     rescanRequested: false,
     sourceTimer: null,
+    worktreesTimer: null,
     fullScanQueued: false,
     queue: Promise.resolve(),
     watcher: null,
@@ -1119,6 +1383,8 @@ function closeRun(run) {
   run.stopped = true;
   clearTimeout(run.sourceTimer);
   run.sourceTimer = null;
+  clearTimeout(run.worktreesTimer);
+  run.worktreesTimer = null;
   clearInterval(run.poll);
   run.poll = null;
   run.watcher?.close();
@@ -1179,7 +1445,7 @@ function reconcileProjects(runtime) {
   }
 
   for (const project of Object.values(runtime.state.projects)) {
-    if (project.active) {
+    if (project.active && !project.goneAt) {
       startProject(runtime, project);
     } else {
       stopProject(runtime, project.id);
@@ -1201,12 +1467,14 @@ export function persistRuntimeState(runtime, options) {
     }
 
     for (const [projectId, project] of Object.entries(runtime.state.projects)) {
-      if (!isObject(stored.projects[projectId])) {
+      const place = recordPlace(stored, projectId);
+
+      if (!place) {
         continue;
       }
 
-      stored.projects[projectId] = {
-        ...stored.projects[projectId],
+      place.holder[place.key] = {
+        ...place.holder[place.key],
         activeSeconds: project.activeSeconds,
         idleSeconds: project.idleSeconds,
         commitCount: project.commitCount,
@@ -1290,11 +1558,12 @@ function trackerJob(options, job) {
 // copy of the claim backend's signed newest version (src/newest-version.mjs), which the Mini says in its title bar; null otherwise,
 // and always in a build that never fetches.
 export function buildSummary(runtime) {
-  const projects = Object.values(runtime.state.projects);
+  // A worktree the tracker found is counted with its repository: not as a project, and its commits are the repository's.
+  const projects = Object.values(runtime.state.projects).filter((project) => !project.worktreeOf);
   const trackingProjects = projects.filter((project) => project.active);
   const focus = runtime.focus ?? focusTimeFrom(runtime.state);
   const totalCommits = projects.reduce((sum, project) => sum + project.commitCount, 0);
-  const totalChangeBatches = projects.reduce((sum, project) => sum + project.changeBatchCount, 0);
+  const totalChangeBatches = Object.values(runtime.state.projects).reduce((sum, project) => sum + project.changeBatchCount, 0);
   const ledger = runtime.ledger ?? loadEqualsLedger();
   const totalEquals = ledger.total_equals;
   const reward = buildRewardSummary({

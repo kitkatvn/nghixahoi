@@ -5,6 +5,7 @@ import process from 'node:process';
 import {reachableAddress} from './api-access.mjs';
 import {writeFileAtomically} from './atomic-file.mjs';
 import {STORE_DIR, withStateLock} from './store.mjs';
+import {trackerPorts} from './tracker-ports.mjs';
 
 // ~/.nghixahoi/tracker.json names the one tracker of this HOME: two trackers would each write their
 // own time into the same projects. Only the tracker it names writes or removes it.
@@ -39,6 +40,15 @@ export function readTrackerRecord() {
   } catch {
     return null;
   }
+}
+
+// The port this HOME's tracker answers on: the one tracker.json names while its process lives, otherwise the first it would take
+// (tracker-ports.mjs). Welcome and the Mini open on it when they are given no port.
+export function recordedTrackerPort() {
+  const record = readTrackerRecord();
+  const port = Number(record?.port);
+
+  return record && isProcessAlive(record.pid) && Number.isInteger(port) && port > 0 ? port : trackerPorts()[0];
 }
 
 function writeTrackerRecord(record) {

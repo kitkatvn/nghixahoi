@@ -290,6 +290,9 @@ export function nghixahoiSkillMarkdown(source) {
     '',
     `    ${LOCAL_SERVER_URL}`,
     '',
+    // Since 0.2.16 (src/tracker-ports.mjs).
+    'or, when another program holds that port, at the next free port up to 4751.',
+    '',
     'When Kit=Code hook context says a milestone was reached, briefly tell the user they can open:',
     '',
     `    ${RUNNER_DISPLAY_PATH} dashboard`,

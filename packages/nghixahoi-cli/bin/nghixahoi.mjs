@@ -36,7 +36,7 @@ import {getDiskRewardSummary} from '../src/reward.mjs';
 import {
   createRuntime,
   DEFAULT_HOST,
-  DEFAULT_PORT,
+  describeWorktrees,
   listProjects,
   prepareState,
   registerProject,
@@ -56,6 +56,7 @@ import {
   updateTrackerRecord,
 } from '../src/tracker-instance.mjs';
 import {stopLegacyTracker} from '../src/legacy.mjs';
+import {describeHolder, firstFreePort, listenOnFirstFree, portHolder, trackerPorts} from '../src/tracker-ports.mjs';
 import {askTrackerToStop, watchForStopRequest} from '../src/tracker-stop.mjs';
 import {startTrackingConfigLoop, TRACKING_CONFIG_DISPLAY_PATH, trackingConfigUrl} from '../src/tracking-config.mjs';
 import {tryNewestVersion} from '../src/newest-version.mjs';
@@ -188,7 +189,8 @@ function parseArgs(argv) {
     command,
     subcommand: argv[3],
     host: DEFAULT_HOST,
-    port: DEFAULT_PORT,
+    // None given: the tracker takes the first free of 4747 to 4751 (src/tracker-ports.mjs).
+    port: undefined,
     source: undefined,
     tier: undefined,
     openDashboard: !parseBooleanEnv(process.env.NGHIXAHOI_NO_OPEN),
@@ -265,7 +267,7 @@ Commands:
 Options:
   --host <host>         Host to bind, default ${DEFAULT_HOST}
   --allow-non-loopback  Let track bind a --host other than 127.0.0.1 or localhost
-  --port <port>         Port to bind, default ${DEFAULT_PORT}
+  --port <port>         Port to bind, default the first free of ${trackerPorts()[0]} to ${trackerPorts().at(-1)}
   --no-open             Do not open the hosted dashboard automatically
   --platform <os>       Preview Welcome chrome: macos|windows|linux (default: host OS)
   --yes                 Confirm destructive commands without prompting
@@ -367,6 +369,11 @@ async function printStatus(options) {
   console.log('Kit=Code status');
   console.log(`  tracker: ${running ? 'running' : found?.state === 'unresponsive' ? 'not responding' : 'stopped'}`);
 
+  // The port, when it is not the first: what holds that one, as the tracker found it when it started (runDaemon).
+  if (running && found?.record && Number(found.record.port) !== trackerPorts()[0]) {
+    console.log(`  port: ${portLine(found.record)}`);
+  }
+
   if (problems.length > 0) {
     // /api/health may be answered by a process squatting the port, so its codes are sanitized and
     // its counts coerced to a number before they are printed (docs/security.md).
@@ -376,12 +383,39 @@ async function printStatus(options) {
     }).join(', ')}; see ${TRACKER_LOG_PATH}`);
   }
   console.log(`  added projects: ${groupedNumber(totals.trackingProjects)}`);
+  printWorktrees();
   const reward = getDiskRewardSummary();
   console.log(`  targets: ${targetsLine(reward.targets)}`);
   console.log(`  campaign: ${campaignLine(reward.campaign)}`);
   printRewardSummary(reward);
 }
 
+
+// The tracker's port, and why it is not the first: the ports it found in use, and what held each, as tracker.json records them.
+function portLine(record) {
+  const inUse = Array.isArray(record.portsInUse) ? record.portsInUse.filter((entry) => Number.isInteger(entry?.port)) : [];
+  const held = inUse.map((entry) => {
+    const holder = describeHolder(entry.heldBy);
+    return holder ? `${entry.port} (held by ${holder})` : String(entry.port);
+  });
+  return `${record.port}${held.length > 0 ? `, since ${held.join(', ')} ${held.length === 1 ? 'was' : 'were'} in use` : ''}`;
+}
+
+// The worktrees of the added repositories (docs/reward-rules.md §5.9): how many are counted with them, and each one git lists that
+// cannot be counted, and why.
+function printWorktrees() {
+  const worktrees = describeWorktrees();
+  const counted = worktrees.filter((worktree) => worktree.state === 'ok').length;
+
+  if (counted > 0) {
+    console.log(`  worktrees: ${groupedNumber(counted)}, counted with their repositories`);
+  }
+
+  for (const worktree of worktrees.filter((entry) => entry.state !== 'ok')) {
+    const why = worktree.state === 'prunable' ? 'git calls it prunable: its folder is gone' : 'git cannot read it';
+    console.log(`  worktree not counted: ${worktree.path} (${why})`);
+  }
+}
 
 // Electron is an optional dependency, and it downloads its binary the first time it is required
 // (node_modules/electron/index.js). Three different failures, each reported as what it is: the
@@ -531,7 +565,8 @@ async function openOnboardingWindow(options = {}) {
   console.log('Opening Kit=Code Welcome...');
   const environment = {
     NGHIXAHOI_HOST: options.host,
-    NGHIXAHOI_PORT: String(options.port),
+    // None given: Welcome starts the tracker without one, and opens the Mini on the port it took.
+    ...(options.port === undefined ? {} : {NGHIXAHOI_PORT: String(options.port)}),
     NGHIXAHOI_INITIAL_PROJECT: path.resolve(options.initialProject ?? process.cwd()),
   };
 
@@ -731,7 +766,7 @@ async function handleHookInstaller(source, action) {
       failed = true;
     }
     if (!onboardingPreferences().completed) {
-      if (!(await openOnboardingWindow({host: DEFAULT_HOST, port: DEFAULT_PORT, initialProject: process.cwd(), welcomeCommand: `${source}-on`}))) {
+      if (!(await openOnboardingWindow({host: DEFAULT_HOST, initialProject: process.cwd(), welcomeCommand: `${source}-on`}))) {
         console.error(`Kit=Code Welcome could not open. Fix Electron install, then re-run \`${CLI_GLOBAL_COMMAND} setup\`.`);
         process.exitCode = 1;
         failed = true;
@@ -764,8 +799,18 @@ async function handleHookInstaller(source, action) {
   process.exit(1);
 }
 
+// Where this HOME's tracker answers: the port given, or the one tracker.json names while its process lives, or the first it takes.
+function trackerAddress(options) {
+  if (options.port !== undefined) {
+    return {host: options.host, port: options.port};
+  }
+
+  const record = readTrackerRecord();
+  return record && isProcessAlive(record.pid) ? {host: record.host ?? options.host, port: Number(record.port)} : {host: options.host, port: trackerPorts()[0]};
+}
+
 async function isServerRunning(options) {
-  return Boolean(await trackerHealth(options));
+  return Boolean(await trackerHealth(trackerAddress(options)));
 }
 
 // `nghixahoi diagnostics status` and `nghixahoi diagnostics send` (docs/way-of-working.md, "A full staging round"): what a tester
@@ -827,7 +872,7 @@ function bindRefusal(options) {
 }
 
 function nonLoopbackWarning(options) {
-  return `Warning: Kit=Code's local API will listen on ${options.host}:${options.port}, where other machines may reach it. It has no authentication. It answers only requests addressed to 127.0.0.1 or localhost: that stops web pages, not other programs, and any program that can connect to it can read your progress.`;
+  return `Warning: Kit=Code's local API will listen on ${options.host}:${options.port ?? trackerPorts().join('|')}, where other machines may reach it. It has no authentication. It answers only requests addressed to 127.0.0.1 or localhost: that stops web pages, not other programs, and any program that can connect to it can read your progress.`;
 }
 
 function sleep(ms) {
@@ -920,7 +965,9 @@ async function runDaemon(options, status = createStatusReporter()) {
   }
 
   const startedAt = new Date().toISOString();
-  const record = {pid: process.pid, host: options.host, port: options.port, startedAt, version: VERSION, tracking: 'ok', problems: [], heartbeatAt: startedAt};
+  // With no --port, the first free of the five (src/tracker-ports.mjs): tracker.json names the first until the tracker listens.
+  const ports = options.port === undefined ? trackerPorts() : [options.port];
+  const record = {pid: process.pid, host: options.host, port: ports[0], startedAt, version: VERSION, tracking: 'ok', problems: [], heartbeatAt: startedAt};
 
   // One tracker per HOME. A tracker that answers, or is starting, keeps its place; only one whose
   // process does not answer may be replaced. The claim is made before anything is written.
@@ -1036,13 +1083,18 @@ async function runDaemon(options, status = createStatusReporter()) {
     exit(0);
   };
 
-  server = app.listen(options.port, options.host, () => {
-    status.stop();
-    log.info(`started: Kit=Code ${VERSION}, process ${process.pid}, http://${options.host}:${options.port}, node ${process.version}`);
-    recordEvent('tracker-started', {projects: Object.values(runtime.state.projects).filter((project) => project.active).length, port: options.port}, {source: 'tracker'});
-  });
+  // Before the ports are tried, which takes a moment: a stop asked meanwhile still saves.
+  process.on('SIGINT', shutdown('SIGINT'));
+  process.on('SIGTERM', shutdown('SIGTERM'));
+  // Windows has no SIGTERM: there `untrack` and `uninstall` leave a stop request (src/tracker-stop.mjs).
+  watchForStopRequest(record, shutdown('stop request'));
 
-  server.on('error', async (error) => {
+  let port;
+  let inUse;
+
+  try {
+    ({server, port, inUse} = await listenOnFirstFree((candidate) => app.listen(candidate, options.host), ports));
+  } catch (error) {
     status.stop();
     await cleanup().catch(() => {});
     releaseTracker(process.pid);
@@ -1051,26 +1103,41 @@ async function runDaemon(options, status = createStatusReporter()) {
     await diagnostics.stop({finalSend: false});
 
     if (error.code === 'EADDRINUSE') {
-      report('error', `Not started: port ${options.port} is already in use. Stop the other server or pass --port <port>.`);
+      report('error', `Not started: ${await portsInUseWords(ports)}`);
       process.exit(1);
     }
 
     report('error', `Not started: ${error.message}`);
     process.exit(1);
-  });
+  }
 
-  process.on('SIGINT', shutdown('SIGINT'));
-  process.on('SIGTERM', shutdown('SIGTERM'));
-  // Windows has no SIGTERM: there `untrack` and `uninstall` leave a stop request (src/tracker-stop.mjs).
-  watchForStopRequest(record, shutdown('stop request'));
+  // What held each port passed over, as the OS says, for `track` and `status` to name: the person's own program, never the agent's.
+  const portsInUse = await Promise.all(inUse.map(async (taken) => ({port: taken, heldBy: await portHolder(taken)})));
+  updateTrackerRecord(process.pid, {port, portsInUse});
+  status.stop();
+  log.info(`started: Kit=Code ${VERSION}, process ${process.pid}, http://${options.host}:${port}, node ${process.version}`);
+
+  if (portsInUse.length > 0) {
+    log.warn(`port ${portLine({port, portsInUse})}`);
+  }
+
+  recordEvent('tracker-started', {projects: Object.values(runtime.state.projects).filter((project) => project.active).length, port}, {source: 'tracker'});
+  server.on('error', (error) => log.error(`The local API failed: ${error?.message ?? error}`));
+}
+
+// Every one of `ports` in use, in words: what holds the first, when the OS says, and what to do.
+async function portsInUseWords(ports) {
+  const holder = describeHolder(await portHolder(ports[0]));
+  const which = ports.length === 1 ? `port ${ports[0]} is` : `ports ${ports[0]} to ${ports.at(-1)} are all`;
+  return `${which} already in use${holder ? ` (${ports[0]} by ${holder})` : ''}. Stop the other program, or pass --port <port>.`;
 }
 
 function printAlreadyRunning(record, options) {
   console.log('Kit=Code tracker is already running.');
   console.log(`Local server: http://${record.host}:${record.port}`);
 
-  if (String(record.host) !== String(options.host) || Number(record.port) !== Number(options.port)) {
-    console.log(`It stays where it is. To move it, run \`${CLI_GLOBAL_COMMAND} untrack\`, then \`${CLI_GLOBAL_COMMAND} track --port ${options.port}\`.`);
+  if (String(record.host) !== String(options.host) || (options.port !== undefined && Number(record.port) !== Number(options.port))) {
+    console.log(`It stays where it is. To move it, run \`${CLI_GLOBAL_COMMAND} untrack\`, then \`${CLI_GLOBAL_COMMAND} track${options.port === undefined ? '' : ` --port ${options.port}`}\`.`);
   }
 }
 
@@ -1108,8 +1175,9 @@ async function startTracker(options) {
     console.log(`tracker.json names process ${running.record.pid}, which does not answer at http://${running.record.host}:${running.record.port}. Starting a new tracker in its place.`);
   } else if (await isServerRunning(options)) {
     // Something answers as Kit=Code here, but no tracker of this HOME: another HOME's, or an old one.
+    const {host, port} = trackerAddress(options);
     console.log('Kit=Code tracker is already running.');
-    console.log(`Local server: http://${options.host}:${options.port}`);
+    console.log(`Local server: http://${host}:${port}`);
     return;
   }
 
@@ -1118,13 +1186,22 @@ async function startTracker(options) {
   prepareState();
   releaseTracker();
 
+  // So are ports all in use: the tracker checks again as it listens.
+  const ports = options.port === undefined ? trackerPorts() : [options.port];
+
+  if (await firstFreePort(options.host, ports) === null) {
+    console.error(`Kit=Code tracker did not start: ${await portsInUseWords(ports)}`);
+    recordTrackerNotStarted('command', 'port-in-use', Object.assign(new Error('every port is in use'), {code: 'EADDRINUSE'}));
+    await sendOnce();
+    process.exit(1);
+  }
+
   const child = spawn(process.execPath, [
     fileURLToPath(import.meta.url),
     'track',
     '--host',
     options.host,
-    '--port',
-    String(options.port),
+    ...(options.port === undefined ? [] : ['--port', String(options.port)]),
     ...(options.allowNonLoopback ? ['--allow-non-loopback'] : []),
   ], {
     detached: true,
@@ -1140,9 +1217,16 @@ async function startTracker(options) {
   child.unref();
 
   for (let attempt = 0; attempt < 25; attempt += 1) {
-    if (await isServerRunning(options)) {
+    const started = readTrackerRecord();
+
+    if (started?.pid === child.pid && await trackerHealth(started)) {
       console.log('Kit=Code tracker started.');
-      console.log(`Local server: http://${options.host}:${options.port}`);
+      console.log(`Local server: http://${started.host}:${started.port}`);
+
+      if (Array.isArray(started.portsInUse) && started.portsInUse.length > 0) {
+        console.log(`Port ${portLine(started)}.`);
+      }
+
       return;
     }
 
@@ -1258,6 +1342,12 @@ try {
 
     if (!totals) {
       console.error('Folder not found.');
+      process.exit(1);
+    }
+
+    // A worktree the tracker found is counted with its repository (docs/reward-rules.md §5.9).
+    if (totals.worktreeOf) {
+      console.error(`This folder is a worktree of ${totals.worktreeOf}, and Kit=Code counts it with that repository. It stops when the worktree is removed with git, or when ${totals.worktreeOf} is removed from Kit=Code.`);
       process.exit(1);
     }
 
