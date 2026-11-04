@@ -30,6 +30,10 @@ export function renderCompanionWindow(apiBase = '') {
     cycleName: MINI_WORDS.brandName.cycle,
     endedName: MINI_WORDS.brandName.ended,
     update: MINI_WORDS.update.replace('{HOST}', () => dashboardHost),
+    seeMore: MINI_WORDS.seeMore,
+    seeMoreTitle: MINI_WORDS.seeMoreTitle,
+    claim: MINI_WORDS.claim,
+    claimTitle: MINI_WORDS.claimTitle,
   };
   // The page's one stylesheet and one script, kept apart so that its policy allows exactly them. Served
   // by the tracker (apiBase ''), the page reads the API from its own origin; the offline copy, from apiBase.
@@ -55,6 +59,8 @@ button{cursor:pointer}
 .metric-label{color:var(--red-color);font-family:var(--font-mono);font-size:7px;font-weight:500;letter-spacing:.3px;text-transform:uppercase;white-space:nowrap}
 .claim-btn{-webkit-app-region:no-drag;background:transparent;color:var(--white-text);font-family:var(--font-mono);font-size:10px;font-weight:500;letter-spacing:1px;padding:3px 12px;cursor:pointer;text-transform:uppercase;border-top:2px solid var(--red-color);border-bottom:2px solid var(--red-color);border-left:1px dashed var(--red-color);border-right:1px dashed var(--red-color);white-space:normal;width:min-content;line-height:1.15;transition:background-color .2s ease}
 .claim-btn:hover,.claim-btn:focus-visible{background:rgba(240,48,48,.15);outline:none}
+.claim-btn.claim-ready{background:#ffd84a;color:#100606;font-weight:700;border-top-color:#ffe37d;border-bottom-color:#ffe37d;border-left-color:#ffe37d;border-right-color:#ffe37d;box-shadow:0 0 12px rgba(255,216,74,.45)}
+.claim-btn.claim-ready:hover,.claim-btn.claim-ready:focus-visible{background:#ffe37d;box-shadow:0 0 18px rgba(255,216,74,.7)}
 .update-line{-webkit-app-region:no-drag;margin-left:auto;border:0;background:transparent;padding:1px 4px;color:var(--white-text);font:500 9px/1 var(--font-mono);letter-spacing:.6px;text-transform:uppercase;white-space:nowrap;transition:background-color .2s ease}
 .update-line[hidden]{display:none}
 .update-line:hover,.update-line:focus-visible{background:rgba(240,48,48,.15);outline:none}
@@ -69,8 +75,10 @@ ${MINI_NUMBER_SCRIPT}
 function showValue(element,shown,full){element.textContent=shown;element.title=shown===full?'':full}
 function updateProgress(value){progressFill.style.width=Math.max(0,Math.min(100,Number(value)||0))+'%'}
 function showUpdate(version){const plain=typeof version==='string'&&/^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})$/.test(version);updateLine.textContent=plain?WORDS.update.replace('{V}',()=>version):'';updateLine.hidden=!plain}
-function render(summary){const reward=summary?.reward||{},global=summary?.global||{},value=Math.max(0,Math.min(100,Math.floor(Number(reward.progressPercent)||0))),cycle=Number.isSafeInteger(reward.cycle)&&reward.cycle>1?reward.cycle:null,ended=reward.campaign?.ended===true;brandSecond.textContent=ended?WORDS.ended:cycle===null?WORDS.counter:withCycle(WORDS.cycle,cycle);brandLabel.setAttribute('aria-label',ended?WORDS.endedName:cycle===null?WORDS.counterName:withCycle(WORDS.cycleName,cycle));percent.textContent=value+'%';const equals=Math.max(0,Math.floor(Number(reward.totalEquals)||0));showValue(countValue,shortNumber(equals),groupedNumber(equals));showValue(workedValue,focusTime(global.totalActiveSeconds),focusTimeFull(global.totalActiveSeconds));updateProgress(value);showUpdate(summary?.update?.version);main.classList.remove('offline')}
-function offline(){percent.textContent='--';showValue(countValue,'--','--');showValue(workedValue,'--','--');updateProgress(0);showUpdate(null);main.classList.add('offline')}
+function claimReached(reward){return Array.isArray(reward.milestones)&&reward.milestones.some((milestone)=>milestone?.percent===100&&(milestone.redeemed===true||milestone.status==='ready'||milestone.status==='redeemed'))}
+function showClaim(ready){dashboardButton.textContent=ready?WORDS.claim:WORDS.seeMore;dashboardButton.title=ready?WORDS.claimTitle:WORDS.seeMoreTitle;if(ready)dashboardButton.classList.add('claim-ready');else dashboardButton.classList.remove('claim-ready')}
+function render(summary){const reward=summary?.reward||{},global=summary?.global||{},value=Math.max(0,Math.min(100,Math.floor(Number(reward.progressPercent)||0))),cycle=Number.isSafeInteger(reward.cycle)&&reward.cycle>1?reward.cycle:null,ended=reward.campaign?.ended===true;brandSecond.textContent=ended?WORDS.ended:cycle===null?WORDS.counter:withCycle(WORDS.cycle,cycle);brandLabel.setAttribute('aria-label',ended?WORDS.endedName:cycle===null?WORDS.counterName:withCycle(WORDS.cycleName,cycle));percent.textContent=value+'%';const equals=Math.max(0,Math.floor(Number(reward.totalEquals)||0));showValue(countValue,shortNumber(equals),groupedNumber(equals));showValue(workedValue,focusTime(global.totalActiveSeconds),focusTimeFull(global.totalActiveSeconds));updateProgress(value);showUpdate(summary?.update?.version);showClaim(!ended&&claimReached(reward));main.classList.remove('offline')}
+function offline(){percent.textContent='--';showValue(countValue,'--','--');showValue(workedValue,'--','--');updateProgress(0);showUpdate(null);showClaim(false);main.classList.add('offline')}
 async function sync(){try{const response=await fetch(API_BASE+'/api/summary');if(!response.ok)throw new Error();render(await response.json())}catch{offline()}}
 const hideButton=document.getElementById('hideButton');function hideCompanion(){try{const result=window.nghixahoiCompanion?.hide?.();if(result&&typeof result.catch==='function')result.catch(()=>window.close());if(!result)window.close()}catch{window.close()}}
 hideButton.addEventListener('pointerdown',(event)=>event.stopPropagation());hideButton.addEventListener('click',(event)=>{event.stopPropagation();hideCompanion()});
@@ -112,6 +120,16 @@ sync();const events=new EventSource(API_BASE+'/api/events');events.addEventListe
   // with commas, "2,500", to 999,999, and from 1,000,000 one decimal and "M", "1.2M", the full number its tooltip; focus time from 1,000
   // hours in whole hours, "1,234h", its minutes in the tooltip. Whole at 560 × 76 at 999,999, 1.2M and 12.5M =, and at 999h 59m, 1,234h
   // and 12,345h (apps/web/e2e/cli-windows.spec.ts).
+  //
+  // Since 2026-11-03 (companion/2-claim-ready; the client: "if the progress is 100% and they're able to claim the voucher, change the
+  // button 'Xem thêm' on the right to 'Nhận Thưởng', the button will be yellow, use the yellow color in the claim button dashboard at
+  // 100% milestone"): while the summary says the cycle's 100 % is reached and the campaign has not ended, the dashboard's own test for
+  // offering the claim (apps/web src/lib/reward-progress.ts, milestoneState; rewards-panel.tsx), the button says "NHẬN THƯỞNG", filled
+  // in the 100 % card's gold (#ffd84a, its words #100606, apps/web src/index.css), and still opens the dashboard. Whether today's
+  // vouchers are open is the claim backend's, which this page never asks: the dashboard says it. Below 100 %, once the campaign has
+  // ended, and while the tracker does not answer, "XEM THÊM" as before. A claim made begins the next cycle once the dashboard hands
+  // its receipt to the tracker, and the button with it. 68 px wide where "XEM THÊM" was 54, the row whole at 12.5M = and 12,345h
+  // (apps/web/e2e/cli-windows.spec.ts).
   return `<!doctype html>
 <html lang="vi"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy({script, style, connect: [apiBase || "'self'"]})}"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${text(MINI_WORDS.title)}</title><style>${style}</style></head>
